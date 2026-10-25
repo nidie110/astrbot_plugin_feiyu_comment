@@ -1,0 +1,16 @@
+name: astrbot_plugin_feiyu_comment
+display_name: 大肥鱼·答应才发
+desc: 让她先写好评论给你看，你回「发」她才真的发出去；只有账号主人能点头，用的是浏览器里已登录的 B 站账号，不存密码、不碰验证码。
+version: 1.1.2
+author: 部署助手
+repo: https://github.com/nidie110/astrbot_plugin_feiyu_comment
+tags:
+  - 评论
+  - B站
+  - 人格
+  - 拟人
+  - 权限
+help: |
+  让她发评论：把视频链接发给她，让她写一句，她会把原文贴出来等你点头。
+  你回「发」就发出去；回「改：新内容」就改；回「算了」就作废。
+  指令：/草稿 看待发 · /废 作废最新 · /发 [id] 直接发 · /发评论 看这篇帮助

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.bak_*
+*.bak-*
+.venv/
+data/
+drafts.json
+sent.json
+state.json

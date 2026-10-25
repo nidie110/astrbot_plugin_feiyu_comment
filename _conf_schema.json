@@ -1,0 +1,84 @@
+{
+  "_sec_basic": {
+    "type": "text",
+    "description": "基础",
+    "hint": "先让她写草稿，你点头她才发。发布用的是这个浏览器里已经登录的 B 站账号。",
+    "obvious_hint": false,
+    "invisible": true,
+    "default": ""
+  },
+  "enable": {
+    "type": "bool",
+    "description": "启用发评论",
+    "hint": "关掉之后连草稿都不存。",
+    "default": true
+  },
+  "dry_run": {
+    "type": "bool",
+    "description": "只试不真发",
+    "hint": "打开后你回「发」也只会在群里回显内容，不会真发到 B 站。第一次装建议先开着试一遍。",
+    "default": false
+  },
+  "owner_ids": {
+    "type": "string",
+    "description": "谁的点头才算数",
+    "hint": "填 QQ 号，多个用逗号隔开。留空 = 只认 AstrBot 管理员（admins_id）。机器人自己发的消息永远不会被当成点头。",
+    "default": ""
+  },
+  "_sec_bsk": {
+    "type": "text",
+    "description": "浏览器",
+    "hint": "用的是你日常那个登录着 B 站的 Edge。",
+    "obvious_hint": false,
+    "invisible": true,
+    "default": ""
+  },
+  "bsk_path": {
+    "type": "string",
+    "description": "bsk 可执行文件",
+    "hint": "留空自动找（PATH / ~/.local/bin/bsk.exe）。",
+    "default": ""
+  },
+  "bsk_browser": {
+    "type": "string",
+    "description": "浏览器实例 ID",
+    "hint": "留空自动取 bsk status 里的第一个实例。评论发在哪个账号，取决于这个实例登录的是谁。",
+    "default": ""
+  },
+  "_sec_limit": {
+    "type": "text",
+    "description": "限制",
+    "hint": "给手滑留的刹车。",
+    "obvious_hint": false,
+    "invisible": true,
+    "default": ""
+  },
+  "max_chars": {
+    "type": "int",
+    "description": "评论最长字数",
+    "hint": "B 站单条上限 1000 字，这里默认压到 180，说人话就够。",
+    "default": 180,
+    "slider": { "min": 20, "max": 1000, "step": 10 }
+  },
+  "ttl_minutes": {
+    "type": "int",
+    "description": "草稿多久失效（分钟）",
+    "hint": "过了时间那条草稿就发不出去了，得让她重写。",
+    "default": 120,
+    "slider": { "min": 5, "max": 1440, "step": 5 }
+  },
+  "daily_limit": {
+    "type": "int",
+    "description": "每天最多发几条",
+    "hint": "防止一晚上刷一堆。",
+    "default": 5,
+    "slider": { "min": 1, "max": 50, "step": 1 }
+  },
+  "min_gap_seconds": {
+    "type": "int",
+    "description": "两条之间最少间隔（秒）",
+    "hint": "太密容易被风控。",
+    "default": 30,
+    "slider": { "min": 0, "max": 600, "step": 5 }
+  }
+}

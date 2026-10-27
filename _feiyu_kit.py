@@ -14,17 +14,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
 
 __version__ = "1.0.0"
 logger = logging.getLogger("feiyu_kit")
+_LOCK = threading.Lock()
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
@@ -69,6 +72,66 @@ def _last_json(text: str) -> dict:
         raise KitError("bsk-no-json", str(e)) from e
 
 
+def _daemon_alive() -> bool:
+    """`~/.bsk/daemon.json` 里记的那个 pid 现在还活着吗。"""
+    try:
+        d = json.loads((Path.home() / ".bsk" / "daemon.json").read_text(encoding="utf-8"))
+        pid = int(d.get("pid") or 0)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return str(pid) in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def ensure_daemon(bsk_exe: str, seconds: float = 25.0) -> bool:
+    """bsk daemon 没在跑就自己拉起来。
+
+    daemon 会自己死（进程崩、机器重启、被任务管理器带走），死了以后每条 bsk 命令都返回
+    `ensure daemon is running`。这里用 DETACHED_PROCESS 起 `--foreground` 模式——
+    bsk 自带的 detached 启动在某些宿主里会报 Job Object breakaway 失败，这条路径更稳。
+    """
+    if _daemon_alive():
+        return True
+    if not bsk_exe:
+        return False
+    logger.warning("[feiyu_kit] bsk daemon 没在跑，尝试自动拉起")
+    flags = 0
+    if os.name == "nt":
+        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(
+            [bsk_exe, "daemon", "start", "--foreground"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=flags, close_fds=True,
+        )
+    except Exception as e:
+        logger.error("[feiyu_kit] 拉 bsk daemon 失败: %s", e)
+        return False
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(0.8)
+        if _daemon_alive():
+            time.sleep(1.5)  # 再给它一点时间把 socket / 扩展握手弄好
+            logger.info("[feiyu_kit] bsk daemon 已拉起")
+            return True
+    logger.error("[feiyu_kit] bsk daemon 拉起来了但没就绪（%.0fs）", seconds)
+    return False
+
+
+def _looks_like_daemon_dead(text: str) -> bool:
+    t = (text or "").lower()
+    return "daemon" in t or "pipe" in t or "connect" in t
+
+
 class Bsk:
     """bsk 命令行的薄封装：所有调用都是同步的，调用方自己决定扔不扔线程。"""
 
@@ -82,6 +145,9 @@ class Bsk:
         return bool(self.exe)
 
     def run(self, *args, timeout: int | None = None) -> str:
+        return self._run(args, timeout, allow_retry=True)
+
+    def _run(self, args, timeout, allow_retry: bool) -> str:
         if not self.exe:
             raise KitError("no-bsk", "没找到 bsk，先在配置里填 bsk_path")
         env = dict(os.environ)
@@ -99,6 +165,12 @@ class Bsk:
         if p.returncode != 0:
             # 原始 stderr 只进日志，别拼进用户可见文案
             logger.debug("[feiyu_kit] bsk stderr: %s", (p.stderr or "")[:500])
+            # daemon 死了是最常见的失败（每条命令都返回 ensure daemon is running），
+            # 先自己拉一次再重试，别把「daemon 崩了」当成「插件坏了」递给用户。
+            if allow_retry and _looks_like_daemon_dead(f"{p.stderr or ''}{p.stdout or ''}"):
+                if ensure_daemon(self.exe):
+                    logger.info("[feiyu_kit] 重试 bsk %s", " ".join(str(a) for a in args[:2]))
+                    return self._run(args, timeout, allow_retry=False)
             raise KitError("bsk-failed", f"exit {p.returncode}")
         return p.stdout or ""
 
@@ -412,7 +484,7 @@ def merge_config(defaults: dict, plugin_cfg: dict | None, legacy_path: Path | No
 
 
 def deepseek_search(query: str, *, count: int = 5, need_content: bool = True,
-                    key: str = "", timeout: int = 20) -> list:
+                    key: str = "", api: str = "", timeout: int = 20) -> list:
     """DeepSeek 搜索接口；返回 [{title,url,site_name,date,summary}]。"""
     import urllib.request  # noqa: PLC0415
 
@@ -447,6 +519,186 @@ def deepseek_search(query: str, *, count: int = 5, need_content: bool = True,
             "summary": str(h.get("summary") or h.get("snippet") or h.get("content") or "").strip(),
         })
     return out
+
+
+# ---------------------------------------------------------------- 能力自述
+# 各插件在 __init__ 里登记一句「我会做什么」，落成一个小 json 文件；
+# persona_mind 每轮读它，拼成一段自述塞进 system prompt。
+# 这样她对「自己有什么本事」是清楚的，不用等用户问「你能干嘛吗」。
+# 走文件而不是内存：插件加载顺序不定，文件不受顺序影响，也能跨重启。
+
+CAP_FILE = Path("data/plugin_data/_feiyu_caps.json")
+
+
+def register_capability(key: str, sentence: str, tier: str = "all") -> None:
+    """登记一项能力。tier: all=谁都能用；admin=只有账号主人。"""
+    text = (sentence or "").strip()
+    if not text:
+        return
+    try:
+        CAP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if CAP_FILE.exists():
+            try:
+                data = json.loads(CAP_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data[str(key)] = {"sentence": text, "tier": "admin" if tier == "admin" else "all"}
+        tmp = CAP_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, CAP_FILE)
+    except Exception:
+        pass  # 登记失败不能影响插件本身
+
+
+def capability_block(*, admin: bool = False, header: str = "") -> str:
+    """拼一段「你手上的本事」。只读文件，读不到就返回空串（插件没装就什么都不说）。"""
+    try:
+        if not CAP_FILE.exists():
+            return ""
+        data = json.loads(CAP_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    lines = []
+    for item in (data or {}).values():
+        if not isinstance(item, dict):
+            continue
+        if item.get("tier") == "admin" and not admin:
+            continue
+        text = str(item.get("sentence") or "").strip()
+        if text:
+            lines.append(f"- {text}")
+    if not lines:
+        return ""
+    head = header or "你手上确实有这些本事（都是你自己的，直接用，别解释自己是怎么做到的，也别把工具名说出去）："
+    return head + "\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 日记素材
+# feiyu_video / feiyu_explore 一直在写这个格式；现在浏览网页、发评论也往里写，
+# 这样她自己做过的事会真的过夜、进日记、影响信念。
+
+
+# ---------------------------------------------------------------- 动作注册表
+# 主模型只看见一个入口工具 feiyu(action)，具体动作由各插件在 __init__ 里登记。
+# 这样她的工具箱是「看视频/搜/读网页/发评论」这种动词，而不是十几个机械步骤。
+
+ACTIONS: dict = {}
+
+
+def register_action(key: str, handler, desc: str = "") -> None:
+    """登记一个任务级动作（同进程内共享）。handler 形如 async (event, **kw) -> str。"""
+    key = (key or "").strip()
+    if not key or not callable(handler):
+        return
+    ACTIONS[key] = {"handler": handler, "desc": (desc or "").strip()}
+
+
+def get_action(key: str):
+    item = ACTIONS.get((key or "").strip())
+    return item["handler"] if item else None
+
+
+def action_help() -> str:
+    return "、".join(k for k in ACTIONS) or "（还没登记）"
+
+
+MOOD_FILE = Path("data/plugin_data/_feiyu_mood.jsonl")
+_DIMS = ("P", "Ar", "D")
+
+
+def record_mood(effects, *, umo: str = "", source: str = "") -> bool:
+    """把她做过的事转成一次情绪冲量（P/Ar/D），排队交给 persona_mind 结算。
+
+    走文件而不是直接 import：插件加载顺序不定，她也不该知道「谁在改我的心情」。
+    冲量会先排队，等她下一次开口前统一衰减+合并，避免两条消息之间情绪乱跳。
+    """
+    if not isinstance(effects, dict):
+        return False
+    clean = {}
+    for k in _DIMS:
+        v = effects.get(k)
+        if isinstance(v, bool):
+            continue
+        try:
+            num = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(num) and abs(num) > 1e-9:
+            clean[k] = max(-8.0, min(8.0, num))
+    if not clean:
+        return False
+    row = {"ts": time.time(), "umo": str(umo or ""), "source": str(source or ""),
+           "effects": clean}
+    with _LOCK:
+        try:
+            MOOD_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with MOOD_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + chr(10))
+            return True
+        except OSError:
+            return False
+
+
+def material_dir(override: str = "") -> Path:
+    raw = (override or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path("data/plugin_data/astrbot_plugin_persona_mind/diary_materials")
+
+
+def record_material(text: str, *, kind: str = "event", source: str = "",
+                    umo: str = "", extra: dict | None = None, mood=None,
+                    dir_override: str = "", max_per_day: int = 40) -> bool:
+    """写一条日记素材（和 feiyu_video 同格式）。重复文本当天只记一次。
+
+    读只用来判断（去重、当日上限），写入一律 append：
+    persona_mind 的 Diary.add 也在往同一个文件追加，整文件重写在并发时会把它刚写的那行吞掉。
+    """
+    body = (text or "").strip()
+    if not body:
+        return False
+    try:
+        base = material_dir(dir_override)
+        base.mkdir(parents=True, exist_ok=True)
+        day = time.strftime("%Y-%m-%d")
+        path = base / f"{day}.jsonl"
+        with _LOCK:
+            return _append_locked(path, body, kind, source, umo, mood, extra, max_per_day)
+    except Exception:
+        return False
+
+
+def _append_locked(path, body, kind, source, umo, mood, extra, max_per_day) -> bool:
+    """调用方必须已持有 _LOCK：读-判-写整段不能拆开，否则并发会突破去重与日上限。"""
+    try:
+        rows: list = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+        if body[:200] in [str(r.get("text") or "")[:200] for r in rows if isinstance(r, dict)]:
+            return False
+        if len(rows) >= max(1, int(max_per_day)):
+            return False
+        rec = {"ts": time.time(), "time": time.strftime("%H:%M"), "kind": kind,
+               "text": body[:400], "source": source or "feiyu", "umo": umo}
+        if mood:
+            rec["mood"] = mood
+        if extra:
+            for k, v in extra.items():
+                if k not in rec:
+                    rec[k] = v
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + chr(10))
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------- 错误文案
@@ -495,3 +747,70 @@ def clean_title(s: str) -> str:
 def clean_prose(s: str) -> str:
     t = re.sub(r"^\s*\d+[).、]\s*", "", (s or ""), flags=re.M)
     return re.sub(r"\s*\n+\s*", " ", t).strip()
+
+
+# ---------------------------------------------------------------- 认人
+#
+# 背景：AstrBot 的 `event.is_admin()` 实现就是 `return self.role == "admin"`，
+# 而 QQ **私聊**事件没有群角色，role 永远是空 —— 所以私聊里 is_admin() 恒为 False。
+# 结果就是「主人在私聊里被当成普通用户」：读个公网页面被拒、管理员动作全不给。
+# 正确做法是按号认人，这里做成一处，各插件别再各写一遍。
+
+_ADMINS_CACHE = {"ts": 0.0, "ids": set()}
+
+
+def global_admins(path: str | Path = "data/cmd_config.json") -> set[str]:
+    """AstrBot 全局管理员号（cmd_config.json 的 admins_id），带 60 秒缓存。"""
+    now = time.time()
+    if now - _ADMINS_CACHE["ts"] < 60:
+        return set(_ADMINS_CACHE["ids"])
+    ids: set[str] = set()
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        for x in raw.get("admins_id") or []:
+            x = str(x).strip()
+            if x:
+                ids.add(x)
+    except Exception as e:
+        logger.debug(f"读全局管理员列表失败（不影响主流程）: {e}")
+    _ADMINS_CACHE["ts"] = now
+    _ADMINS_CACHE["ids"] = set(ids)
+    return ids
+
+
+def is_owner(event, cfg=None, key: str = "owner_ids") -> bool:
+    """这条消息是不是账号主人发的。
+
+    判定顺序：插件配置的 owner_ids（填了就只认它）→ 全局 admins_id → event.is_admin()。
+    机器人自己发的消息一律不算（防「自己的回复被当成人点头」）。
+    """
+    try:
+        sid = str(event.get_sender_id() or "")
+    except Exception:
+        sid = ""
+    if not sid:
+        return False
+    try:
+        if hasattr(event, "get_self_id") and sid == str(event.get_self_id() or ""):
+            return False
+    except Exception:
+        pass
+
+    raw = ""
+    try:
+        if cfg is not None and hasattr(cfg, "get"):
+            raw = str(cfg.get(key) or "")
+    except Exception:
+        raw = ""
+    ids = {x.strip() for x in raw.replace("，", ",").replace(" ", ",").split(",") if x.strip()}
+    if sid in ids:
+        return True
+    if ids:
+        # 填了白名单就只认它：插件级比全局管理员更细，不让全局名单绕过
+        return False
+    if sid in global_admins():
+        return True
+    try:
+        return bool(event.is_admin())
+    except Exception:
+        return False

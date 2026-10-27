@@ -58,27 +58,54 @@
     "description": "评论最长字数",
     "hint": "B 站单条上限 1000 字，这里默认压到 180，说人话就够。",
     "default": 180,
-    "slider": { "min": 20, "max": 1000, "step": 10 }
+    "slider": {
+      "min": 20,
+      "max": 1000,
+      "step": 10
+    }
+  },
+  "read_limit": {
+    "type": "int",
+    "description": "读评论时取几条",
+    "hint": "只读操作，按热度取前 N 条。1-20，默认 10。",
+    "default": 10,
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    }
   },
   "ttl_minutes": {
     "type": "int",
     "description": "草稿多久失效（分钟）",
     "hint": "过了时间那条草稿就发不出去了，得让她重写。",
     "default": 120,
-    "slider": { "min": 5, "max": 1440, "step": 5 }
+    "slider": {
+      "min": 5,
+      "max": 1440,
+      "step": 5
+    }
   },
   "daily_limit": {
     "type": "int",
     "description": "每天最多发几条",
     "hint": "防止一晚上刷一堆。",
     "default": 5,
-    "slider": { "min": 1, "max": 50, "step": 1 }
+    "slider": {
+      "min": 1,
+      "max": 50,
+      "step": 1
+    }
   },
   "min_gap_seconds": {
     "type": "int",
     "description": "两条之间最少间隔（秒）",
     "hint": "太密容易被风控。",
     "default": 30,
-    "slider": { "min": 0, "max": 600, "step": 5 }
+    "slider": {
+      "min": 0,
+      "max": 600,
+      "step": 5
+    }
   }
 }
